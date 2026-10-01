@@ -2,7 +2,7 @@
 //
 // How it works: a click-through, topmost window hosts a Magnifier control at 1:1 scale
 // that shows the screen content directly underneath it, run through a colour matrix
-// (invert, hue shift, value shift, ...). The window is clipped (SetWindowRgn) to the exact
+// (invert, hue shift, adaptive max contrast, ...). The window is clipped (SetWindowRgn) to the exact
 // crosshair pixel mask, so every crosshair pixel is a transformed copy of whatever is behind
 // it. Refreshes once per compositor frame (DwmFlush), i.e. at your monitor's refresh rate.
 //
@@ -211,9 +211,11 @@ static Component makeComponent(int type) {
 }
 
 // Effects, applied in this order. Each is a checkbox; some have a value.
-enum { FX_GRAY, FX_INVERT, FX_INVVAL, FX_HUE, FX_SAT, FX_CONTRAST, FX_VALUE, FX_OVERLAY, FX_COUNT };
+// Max contrast is adaptive and replaces all the others when it is on.
+enum { FX_MAXCON, FX_GRAY, FX_INVERT, FX_INVVAL, FX_HUE, FX_SAT, FX_CONTRAST, FX_VALUE, FX_OVERLAY, FX_COUNT };
 struct FxDef { const char* key; const char* valKey; const wchar_t* label; int lo, hi, defVal; bool defOn; };
 static const FxDef kFx[FX_COUNT] = {
+    { "max_contrast",  "max_contrast_color", L"Max contrast (color %)", 0, 100, 100, false },
     { "grayscale",     nullptr,           L"Grayscale",         0,    0,   0,   false },
     { "invert",        nullptr,           L"Invert colors",     0,    0,   0,   true  },
     { "invert_value",  nullptr,           L"Invert brightness", 0,    0,   0,   false },
@@ -650,6 +652,24 @@ static MagColorEffect buildEffect(const Effects& fx) {
     const float lr = 0.2126f, lg = 0.7152f, lb = 0.0722f;   // Rec.709 luma
     M5 m = identity5();
     auto apply = [&](const M5& s) { m = mul5(s, m); };
+    if (fx.on[FX_MAXCON]) {
+        // Per pixel, the colour furthest from the background c is the opposite corner of the
+        // RGB cube: each channel becomes 1 if c < 0.5, else 0. The matrix itself is affine, but
+        // the output is clamped to [0, 1], so a very steep "invert" produces exactly that step:
+        //   out = clamp(K * (0.5 - s) + 0.5),  s = w * c + (1 - w) * luma
+        // w = 1 decides every channel separately (furthest colour), w = 0 decides on brightness
+        // only (pure black or white), anything between mixes the two. A large K keeps the step
+        // between the 8-bit levels 127 and 128 and leaves almost no grey band around it.
+        const float K = 4096.0f, w = fx.val[FX_MAXCON] / 100.0f, l[3] = { lr, lg, lb };
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) m[i][j] = -K * ((i == j ? w : 0.0f) + (1.0f - w) * l[j]);
+            m[i][4] = 0.5f * K + 0.5f;
+        }
+        MagColorEffect e;
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j) e.transform[i][j] = m[j][i];
+        return e;
+    }
     if (fx.on[FX_GRAY]) {
         M5 s = identity5();
         for (int i = 0; i < 3; ++i) { s[i][0] = lr; s[i][1] = lg; s[i][2] = lb; }
@@ -1033,6 +1053,17 @@ static void populateCompPanel() {
     --g_populating;
 }
 
+// Max contrast replaces the other effects, so grey them out while it is on.
+static void enableFxControls() {
+    bool others = !cur().fx.on[FX_MAXCON];
+    for (int i = 0; i < FX_COUNT; ++i) {
+        if (i == FX_MAXCON) continue;
+        EnableWindow(g_fxCheck[i], others);
+        if (g_fxVal[i].edit) { EnableWindow(g_fxVal[i].edit, others); EnableWindow(g_fxVal[i].ud, others); }
+    }
+    for (int i = 0; i < 3; ++i) { EnableWindow(g_rgb[i].edit, others); EnableWindow(g_rgb[i].ud, others); }
+}
+
 static void populateFx() {
     const Effects& fx = cur().fx;
     for (int i = 0; i < FX_COUNT; ++i) {
@@ -1040,6 +1071,7 @@ static void populateFx() {
         if (g_fxVal[i].edit) setInt(g_fxVal[i], fx.val[i]);
     }
     for (int i = 0; i < 3; ++i) setInt(g_rgb[i], fx.rgb[i]);
+    enableFxControls();
 }
 
 static void populateOffsets() {
@@ -1275,7 +1307,11 @@ static void readFx() {
         if (g_fxVal[i].edit) fx.val[i] = getInt(g_fxVal[i], kFx[i].lo, kFx[i].hi, fx.val[i]);
     }
     for (int i = 0; i < 3; ++i) fx.rgb[i] = getInt(g_rgb[i], 0, 255, fx.rgb[i]);
-    if (!fx.any()) setStatus(L"No effect enabled: the crosshair pixels look exactly like the screen (invisible).");
+    enableFxControls();
+    if (fx.on[FX_MAXCON])
+        setStatus(L"Max contrast: every pixel takes the colour furthest from what is under it "
+                  L"(100% = per colour channel, 0% = black / white by brightness).");
+    else if (!fx.any()) setStatus(L"No effect enabled: the crosshair pixels look exactly like the screen (invisible).");
 }
 
 // ---------------------------------------------------------------- component operations
@@ -1896,7 +1932,7 @@ static void createEditor() {
     label(L"Blue = drawn, black = component, pink = erased.", 350, 608, 360);
 
     // ---- column 3: effects, hotkeys
-    group(L"Effects (applied top to bottom)", 730, 6, 270, 268);
+    group(L"Effects (applied top to bottom)", 730, 6, 270, 294);
     for (int i = 0; i < FX_COUNT; ++i) {
         int y = 26 + i * 26;
         g_fxCheck[i] = check(kFx[i].label, 740, y, 170, ID_FX_CHECK + i);
@@ -1911,14 +1947,14 @@ static void createEditor() {
         }
     }
 
-    group(L"Hotkeys (click a box, press the keys)", 730, 280, 270, 360);
+    group(L"Hotkeys (click a box, press the keys)", 730, 306, 270, 334);
     for (int i = 0; i < HK_COUNT; ++i) {
-        int y = 300 + i * 27;
+        int y = 326 + i * 25;
         label(kHk[i].label, 740, y, 110);
         g_hkCtrl[i] = mk(HOTKEY_CLASSW, L"", WS_TABSTOP, 850, y, 118, 22, ID_HK + i, WS_EX_CLIENTEDGE);
         button(L"\u00D7", 970, y, 22, ID_HK_CLEAR + i, 22);
     }
-    button(L"Reset to defaults", 740, 300 + HK_COUNT * 27 + 4, 130, ID_HK_DEFAULTS);
+    button(L"Reset to defaults", 740, 326 + HK_COUNT * 25 + 4, 130, ID_HK_DEFAULTS);
 
     // ---- bottom bar
     g_status = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 10, 655, 770, 20, -1);
