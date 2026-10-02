@@ -1,2 +1,4 @@
 crosshair.exe
 *.obj
+*.res
+*_res.o

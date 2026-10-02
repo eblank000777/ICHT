@@ -10,10 +10,15 @@
 // of hand-drawn pixel edits on top. Everything is edited live in the editor window, saved as
 // presets (presets\*.ini next to the exe) and switched with hotkeys or the tray icon.
 //
-// Build (MSVC, x64 Native Tools prompt):
-//   cl /O2 /EHsc /std:c++17 crosshair.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib dwmapi.lib winmm.lib
-// Build (MinGW-w64):
-//   g++ -O2 -std=c++17 -municode -mwindows -static crosshair.cpp -o crosshair.exe -ldwmapi -lwinmm -lshell32 -lgdi32
+// Settings and presets live next to the exe, or in %APPDATA%\Crosshair if that folder is not
+// writable. The editor has a light and a dark theme (or follows Windows). Start with /tray to
+// start with the editor hidden.
+//
+// Build: run build.bat (MSVC or MinGW-w64; it also compiles the icon from crosshair.rc).
+// Manual build without the icon:
+//   cl /O2 /EHsc /std:c++17 crosshair.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib advapi32.lib dwmapi.lib winmm.lib
+//   g++ -O2 -std=c++17 -municode -mwindows -static crosshair.cpp -o crosshair.exe -ldwmapi -lwinmm -lshell32 -lgdi32 -ladvapi32
+// Installer: installer\build_installer.bat (needs NSIS) builds CrosshairSetup.exe.
 //
 // Default hotkeys (all changeable in the editor):
 //   Ctrl+Alt+H       show / hide crosshair       Ctrl+Alt+E   show / hide editor
@@ -60,6 +65,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
 #endif
@@ -287,15 +293,18 @@ static std::string vkName(UINT vk) {
     snprintf(buf, sizeof(buf), "0x%02X", vk & 0xFF);
     return buf;
 }
-static std::string hotkeyToString(UINT hk) {
-    UINT mods = hk >> 16, vk = hk & 0xFFFF;
-    if (!vk) return "None";
+static std::string modsPrefix(UINT mods) {
     std::string s;
     if (mods & MOD_CONTROL) s += "Ctrl+";
     if (mods & MOD_ALT)     s += "Alt+";
     if (mods & MOD_SHIFT)   s += "Shift+";
     if (mods & MOD_WIN)     s += "Win+";
-    return s + vkName(vk);
+    return s;
+}
+static std::string hotkeyToString(UINT hk) {
+    UINT vk = hk & 0xFFFF;
+    if (!vk) return "None";
+    return modsPrefix(hk >> 16) + vkName(vk);
 }
 static UINT parseHotkey(const std::string& text) {
     UINT mods = 0, vk = 0;
@@ -330,10 +339,12 @@ struct Settings {
     int monitor = 0;              // 0 = primary, 1..N = enumeration order
     int fps = 0;                  // 0 = sync to display refresh
     bool startHidden = false;     // start with the editor hidden in the tray
+    int theme = 0;                // editor colours: 0 = follow Windows, 1 = light, 2 = dark
     UINT hk[HK_COUNT];
     Settings() { for (int i = 0; i < HK_COUNT; ++i) hk[i] = defaultHotkey(i); }
 };
 
+static const char* kThemeNames[3] = { "system", "light", "dark" };
 static fs::path g_iniPath, g_presetDir;
 static Settings g_set;
 
@@ -346,6 +357,7 @@ static void loadSettings() {
         else if (key == "monitor")      g_set.monitor = std::max(0, v);
         else if (key == "fps")          g_set.fps = std::max(0, v);
         else if (key == "start_hidden") g_set.startHidden = v != 0;
+        else if (key == "theme")        g_set.theme = lower(val) == "dark" ? 2 : lower(val) == "light" ? 1 : 0;
         else for (int i = 0; i < HK_COUNT; ++i) if (key == kHk[i].key) g_set.hk[i] = parseHotkey(val);
     }
 }
@@ -358,7 +370,8 @@ static void saveSettings() {
     f << "preset       = " << w2u(g_set.preset) << "\n";
     f << "monitor      = " << g_set.monitor << "   # 0 = primary, 1, 2, ... = other monitors\n";
     f << "fps          = " << g_set.fps << "   # 0 = every display refresh; otherwise a fixed update rate\n";
-    f << "start_hidden = " << (g_set.startHidden ? 1 : 0) << "   # 1 = start with the editor hidden in the tray\n\n";
+    f << "start_hidden = " << (g_set.startHidden ? 1 : 0) << "   # 1 = start with the editor hidden in the tray\n";
+    f << "theme        = " << kThemeNames[std::clamp(g_set.theme, 0, 2)] << "   # editor colours: system, light or dark\n\n";
     f << "# Hotkeys: Ctrl/Alt/Shift/Win + key (A-Z, 0-9, F1-F24, Left, Right, Up, Down, Home, End,\n"
          "# PageUp, PageDown, Insert, Delete, Space, Num0-9, ...), or None\n";
     for (int i = 0; i < HK_COUNT; ++i) f << kHk[i].key << " = " << hotkeyToString(g_set.hk[i]) << "\n";
@@ -763,14 +776,16 @@ static PxSet g_base, g_final;   // component layer / final mask of the current p
 static HWND  g_host = nullptr, g_mag = nullptr;
 static RECT  g_src = {};
 static bool  g_visible = true, g_hasPixels = false, g_hkRegistered = false;
-static HICON g_icon = nullptr;
+static HICON g_icon = nullptr, g_iconBig = nullptr;
 
 static Preset& cur() { return g_presets[g_cur]; }
 
 // editor controls
-struct NumEdit { HWND edit = nullptr, ud = nullptr; };
+struct NumEdit { HWND edit = nullptr, ud = nullptr; int lo = 0, hi = 0; };
 static HWND g_editor = nullptr, g_grid = nullptr, g_status = nullptr, g_hover = nullptr;
-static HWND g_presetCombo, g_nameEdit, g_compList, g_compType, g_compGroup;
+static HWND g_presetCombo, g_nameEdit, g_compList, g_compType, g_themeCombo, g_legend;
+static int g_compGroupIdx = -1;
+static std::vector<NumEdit> g_numEdits;   // for arrow-key stepping
 static HWND g_cEnabled, g_cSubtract, g_pLabel[3], g_cFlag[4];
 static NumEdit g_pEdit[3], g_cX, g_cY;
 static std::vector<HWND> g_compCtrls;   // enabled only while a component is selected
@@ -788,11 +803,12 @@ static UINT g_taskbarCreated = 0;
 
 enum {
     WM_APP_TRAY = WM_APP + 1, WM_APP_SHOW,
+    WM_APP_QUIT = WM_APP + 3,   // sent by the installer / uninstaller to close a running copy
     ID_PRESET_COMBO = 100, ID_PRESET_NAME, ID_PRESET_SAVE, ID_PRESET_NEW, ID_PRESET_DELETE,
     ID_COMP_LIST, ID_COMP_TYPE, ID_COMP_ADD, ID_COMP_DUP, ID_COMP_REMOVE, ID_COMP_UP, ID_COMP_DOWN,
     ID_COMP_ENABLED, ID_COMP_SUBTRACT, ID_COMP_P0, ID_COMP_P1, ID_COMP_P2, ID_COMP_X, ID_COMP_Y,
     ID_COMP_F0, ID_COMP_F1, ID_COMP_F2, ID_COMP_F3,
-    ID_MONITOR, ID_FPS, ID_OVERLAY_VISIBLE, ID_START_HIDDEN,
+    ID_MONITOR, ID_FPS, ID_OVERLAY_VISIBLE, ID_START_HIDDEN, ID_THEME,
     ID_GRID, ID_MIRROR_H, ID_MIRROR_V, ID_VIEW_RADIUS, ID_CLEAR_PIXELS, ID_BAKE, ID_UNDO, ID_REDO,
     ID_OFF_X, ID_OFF_Y, ID_CENTRE,
     ID_HK_DEFAULTS, ID_HIDE, ID_QUIT,
@@ -890,17 +906,401 @@ static HWND mk(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int 
 static HWND label(const wchar_t* text, int x, int y, int w) { return mk(L"STATIC", text, SS_LEFT | SS_NOPREFIX, x, y + 3, w, 18, -1); }
 static HWND button(const wchar_t* text, int x, int y, int w, int id, int h = 24) { return mk(L"BUTTON", text, WS_TABSTOP | BS_PUSHBUTTON, x, y, w, h, id); }
 static HWND check(const wchar_t* text, int x, int y, int w, int id) { return mk(L"BUTTON", text, WS_TABSTOP | BS_AUTOCHECKBOX, x, y, w, 22, id); }
-static HWND group(const wchar_t* text, int x, int y, int w, int h) { return mk(L"BUTTON", text, BS_GROUPBOX, x, y, w, h, -1); }
 static HWND combo(int x, int y, int w, int id) { return mk(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, x, y, w, 300, id); }
+
+// ---------------------------------------------------------------- theme
+// Standard controls mostly ignore colours, so in dark mode buttons and checkboxes are custom
+// drawn (NM_CUSTOMDRAW), group frames are painted by the editor itself, and the spin buttons
+// and hotkey boxes are small custom controls. Light mode keeps the native look.
+
+struct Palette {
+    COLORREF bg, text, textDim, ctrl, ctrlHot, ctrlPressed, border, accent, groupLine, spin, arrow;
+    COLORREF gridGap, gridEmpty, gridAxis, gridOn, gridDrawn, gridErasedOn, gridErasedOff, gridCentre;
+};
+static Palette g_pal;
+static bool g_dark = false;
+static HBRUSH g_bgBrush = nullptr, g_ctrlBrush = nullptr;
+
+typedef HRESULT (WINAPI *PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
+static PFN_SetWindowTheme pSetWindowTheme;
+
+static bool systemUsesDarkApps() {
+    DWORD v = 1, size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &size) != ERROR_SUCCESS)
+        return false;
+    return v == 0;
+}
+
+static void loadPalette() {
+    g_dark = g_set.theme == 2 || (g_set.theme == 0 && systemUsesDarkApps());
+    Palette& p = g_pal;
+    if (g_dark) {
+        p.bg = RGB(32, 32, 32);        p.text = RGB(235, 235, 235);    p.textDim = RGB(125, 125, 125);
+        p.ctrl = RGB(45, 45, 45);      p.ctrlHot = RGB(62, 62, 62);    p.ctrlPressed = RGB(80, 80, 80);
+        p.border = RGB(92, 92, 92);    p.accent = RGB(0, 120, 215);    p.groupLine = RGB(68, 68, 68);
+        p.spin = RGB(52, 52, 52);      p.arrow = RGB(205, 205, 205);
+        p.gridGap = RGB(24, 24, 24);   p.gridEmpty = RGB(46, 46, 46);  p.gridAxis = RGB(54, 59, 74);
+        p.gridOn = RGB(225, 225, 225); p.gridDrawn = RGB(40, 140, 255);
+        p.gridErasedOn = RGB(170, 70, 70); p.gridErasedOff = RGB(88, 52, 52); p.gridCentre = RGB(255, 70, 70);
+    } else {
+        p.bg = GetSysColor(COLOR_BTNFACE); p.text = GetSysColor(COLOR_WINDOWTEXT); p.textDim = GetSysColor(COLOR_GRAYTEXT);
+        p.ctrl = RGB(255, 255, 255);   p.ctrlHot = RGB(229, 241, 251); p.ctrlPressed = RGB(204, 228, 247);
+        p.border = RGB(160, 160, 160); p.accent = RGB(0, 120, 215);    p.groupLine = RGB(215, 215, 215);
+        p.spin = RGB(236, 236, 236);   p.arrow = RGB(90, 90, 90);
+        p.gridGap = RGB(205, 205, 205); p.gridEmpty = RGB(255, 255, 255); p.gridAxis = RGB(232, 238, 250);
+        p.gridOn = RGB(40, 40, 40);    p.gridDrawn = RGB(0, 105, 230);
+        p.gridErasedOn = RGB(255, 160, 160); p.gridErasedOff = RGB(255, 228, 228); p.gridCentre = RGB(230, 30, 30);
+    }
+    if (g_bgBrush) DeleteObject(g_bgBrush);
+    if (g_ctrlBrush) DeleteObject(g_ctrlBrush);
+    g_bgBrush = CreateSolidBrush(p.bg);
+    g_ctrlBrush = CreateSolidBrush(p.ctrl);
+}
+
+static DWORD windowsBuild() {
+    typedef LONG (WINAPI *PFN_RtlGetVersion)(OSVERSIONINFOW*);
+    auto f = (PFN_RtlGetVersion)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    OSVERSIONINFOW v{};
+    v.dwOSVersionInfoSize = sizeof(v);
+    return (f && f(&v) == 0) ? v.dwBuildNumber : 0;
+}
+
+// Dark tray menu. These uxtheme exports are undocumented (Explorer, Notepad++ etc. use them),
+// so they are only looked up on Windows builds where they exist with this signature.
+static void setMenuDarkMode(bool dark) {
+    typedef int  (WINAPI *PFN_SetPreferredAppMode)(int);
+    typedef void (WINAPI *PFN_FlushMenuThemes)();
+    static bool looked = false;
+    static PFN_SetPreferredAppMode setMode;
+    static PFN_FlushMenuThemes flush;
+    if (!looked) {
+        looked = true;
+        HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+        if (ux && windowsBuild() >= 18362) {
+            setMode = (PFN_SetPreferredAppMode)(void*)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+            flush = (PFN_FlushMenuThemes)(void*)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+        }
+    }
+    if (setMode) setMode(dark ? 2 : 3);   // ForceDark / ForceLight
+    if (flush) flush();
+}
+
+static void fillSolid(HDC dc, const RECT& r, COLORREF c) {
+    SetDCBrushColor(dc, c);
+    FillRect(dc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
+}
+static void fillRound(HDC dc, const RECT& r, COLORREF fill, COLORREF line, int radius) {
+    HBRUSH b = CreateSolidBrush(fill);
+    HPEN p = CreatePen(PS_SOLID, 1, line);
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(b);
+    DeleteObject(p);
+}
+
+// Group frames, painted by the editor window (works in both themes).
+struct GroupBox { int x, y, w, h; std::wstring title; };
+static std::vector<GroupBox> g_groups;
+
+static int group(const wchar_t* text, int x, int y, int w, int h) {
+    g_groups.push_back({ x, y, w, h, text });
+    return (int)g_groups.size() - 1;
+}
+static void setGroupTitle(int i, const std::wstring& title) {
+    if (i < 0 || g_groups[i].title == title) return;
+    GroupBox& g = g_groups[i];
+    g.title = title;
+    RECT r = { S(g.x), S(g.y), S(g.x + g.w), S(g.y + 20) };
+    InvalidateRect(g_editor, &r, TRUE);
+}
+static void paintGroups(HDC dc) {
+    HGDIOBJ oldFont = SelectObject(dc, g_font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    HPEN pen = CreatePen(PS_SOLID, 1, g_pal.groupLine);
+    HGDIOBJ oldPen = SelectObject(dc, pen), oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, g_pal.text);
+    for (auto& g : g_groups) {
+        RECT r = { S(g.x), S(g.y), S(g.x + g.w), S(g.y + g.h) };
+        RoundRect(dc, r.left, r.top + tm.tmHeight / 2, r.right, r.bottom, S(6), S(6));
+        SIZE sz;
+        GetTextExtentPoint32W(dc, g.title.c_str(), (int)g.title.size(), &sz);
+        RECT tr = { r.left + S(6), r.top, r.left + S(14) + sz.cx, r.top + tm.tmHeight };
+        FillRect(dc, &tr, g_bgBrush);
+        TextOutW(dc, r.left + S(10), r.top, g.title.c_str(), (int)g.title.size());
+    }
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldFont);
+    DeleteObject(pen);
+}
+
+// Dark-mode painting for push buttons and checkboxes (comctl32 v6 custom draw).
+static LRESULT customDrawButton(const NMCUSTOMDRAW* cd) {
+    if (!g_dark || cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    HWND h = cd->hdr.hwndFrom;
+    LONG type = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
+    bool isCheck = type == BS_AUTOCHECKBOX || type == BS_CHECKBOX;
+    if (!isCheck && type != BS_PUSHBUTTON && type != BS_DEFPUSHBUTTON) return CDRF_DODEFAULT;
+
+    HDC dc = cd->hdc;
+    RECT rc = cd->rc;
+    bool disabled = !IsWindowEnabled(h);
+    bool hot = (cd->uItemState & CDIS_HOT) != 0, pressed = (cd->uItemState & CDIS_SELECTED) != 0;
+    bool focus = (cd->uItemState & CDIS_FOCUS) != 0;
+    wchar_t text[128];
+    GetWindowTextW(h, text, 128);
+    HGDIOBJ oldFont = SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, disabled ? g_pal.textDim : g_pal.text);
+    fillSolid(dc, rc, g_pal.bg);
+    if (isCheck) {
+        bool checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        int bs = S(14), top = (rc.top + rc.bottom - bs) / 2;
+        RECT box = { rc.left + S(1), top, rc.left + S(1) + bs, top + bs };
+        COLORREF fill = checked ? (disabled ? g_pal.border : g_pal.accent)
+                                : (pressed ? g_pal.ctrlPressed : hot ? g_pal.ctrlHot : g_pal.ctrl);
+        fillRound(dc, box, fill, checked ? fill : ((hot || focus) && !disabled ? g_pal.accent : g_pal.border), S(4));
+        if (checked) {
+            HPEN pen = CreatePen(PS_SOLID, std::max(2, S(2)), RGB(255, 255, 255));
+            HGDIOBJ op = SelectObject(dc, pen);
+            POINT pts[3] = { { box.left + bs * 22 / 100, box.top + bs * 52 / 100 },
+                             { box.left + bs * 42 / 100, box.top + bs * 72 / 100 },
+                             { box.left + bs * 78 / 100, box.top + bs * 30 / 100 } };
+            Polyline(dc, pts, 3);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
+        RECT tr = rc;
+        tr.left = box.right + S(6);
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    } else {
+        COLORREF fill = disabled ? g_pal.bg : pressed ? g_pal.ctrlPressed : hot ? g_pal.ctrlHot : g_pal.ctrl;
+        fillRound(dc, rc, fill, focus ? g_pal.accent : g_pal.border, S(6));
+        DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    SelectObject(dc, oldFont);
+    return CDRF_SKIPDEFAULT;
+}
+
+// ---- spin buttons next to number boxes (click, hold to repeat, Shift = 10, wheel)
+
+struct SpinData { HWND buddy; int lo, hi, pressed, hot, step; };   // pressed / hot: +1 up, -1 down
+
+static void stepEdit(HWND edit, int lo, int hi, int delta) {
+    wchar_t b[32];
+    GetWindowTextW(edit, b, 32);
+    long v = wcstol(b, nullptr, 10);
+    SetWindowTextW(edit, std::to_wstring(std::clamp<long>(v + delta, lo, hi)).c_str());   // fires EN_CHANGE
+}
+
+static LRESULT CALLBACK spinProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    SpinData* d = (SpinData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    RECT rc;
+    GetClientRect(h, &rc);
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        int mid = rc.bottom / 2, s = std::max(2, S(3));
+        bool en = IsWindowEnabled(h) != FALSE;
+        for (int half = 0; half < 2; ++half) {
+            int dir = half == 0 ? 1 : -1;
+            RECT r = { 0, half ? mid : 0, rc.right, half ? rc.bottom : mid };
+            COLORREF col = !d || !en ? g_pal.spin : d->pressed == dir ? g_pal.ctrlPressed : d->hot == dir ? g_pal.ctrlHot : g_pal.spin;
+            fillSolid(dc, r, col);
+            int cx = rc.right / 2, cy = (r.top + r.bottom) / 2, k = dir * ((s + 1) / 2);
+            POINT tri[3] = { { cx - s, cy + k }, { cx + s + 1, cy + k }, { cx, cy - k - dir } };
+            COLORREF ac = en ? g_pal.arrow : g_pal.textDim;
+            HBRUSH b = CreateSolidBrush(ac);
+            HPEN p = CreatePen(PS_SOLID, 1, ac);
+            HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+            Polygon(dc, tri, 3);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(b);
+            DeleteObject(p);
+        }
+        SetDCBrushColor(dc, g_pal.border);
+        FrameRect(dc, &rc, (HBRUSH)GetStockObject(DC_BRUSH));
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (!d) break;
+        SetCapture(h);
+        d->pressed = GET_Y_LPARAM(lp) < rc.bottom / 2 ? 1 : -1;
+        d->step = (wp & MK_SHIFT) ? 10 : 1;
+        stepEdit(d->buddy, d->lo, d->hi, d->pressed * d->step);
+        SetTimer(h, 1, 400, nullptr);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_TIMER:
+        if (d && d->pressed) {
+            stepEdit(d->buddy, d->lo, d->hi, d->pressed * d->step);
+            SetTimer(h, 1, 50, nullptr);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == h) ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        KillTimer(h, 1);
+        if (d) d->pressed = 0;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (d) {
+            int hot = GET_Y_LPARAM(lp) < rc.bottom / 2 ? 1 : -1;
+            if (hot != d->hot) {
+                d->hot = hot;
+                TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 };
+                TrackMouseEvent(&t);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (d) { d->hot = 0; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (d) stepEdit(d->buddy, d->lo, d->hi, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1);
+        return 0;
+    case WM_ENABLE:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_NCDESTROY:
+        delete d;
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
 static NumEdit numEdit(int x, int y, int w, int id, int lo, int hi) {
     NumEdit n;
-    n.edit = mk(L"EDIT", L"0", WS_TABSTOP | ES_AUTOHSCROLL, x, y, w, 22, id, WS_EX_CLIENTEDGE);
-    n.ud = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
-                           WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
-                           0, 0, 0, 0, g_editor, nullptr, g_inst, nullptr);
-    SendMessageW(n.ud, UDM_SETBUDDY, (WPARAM)n.edit, 0);
-    SendMessageW(n.ud, UDM_SETRANGE32, (WPARAM)lo, (LPARAM)hi);
+    n.edit = mk(L"EDIT", L"0", WS_TABSTOP | ES_AUTOHSCROLL, x, y, w - 15, 22, id, WS_EX_CLIENTEDGE);
+    n.ud = mk(L"CrosshairSpin", L"", 0, x + w - 16, y, 16, 22, -1);
+    SetWindowLongPtrW(n.ud, GWLP_USERDATA, (LONG_PTR)new SpinData{ n.edit, lo, hi, 0, 0, 1 });
+    n.lo = lo;
+    n.hi = hi;
+    g_numEdits.push_back(n);
     return n;
+}
+
+// ---- hotkey box: click it, press a key combination
+
+static const UINT KB_SETHOTKEY = WM_USER + 1, KB_GETHOTKEY = WM_USER + 2;
+
+static bool isModifierVk(UINT vk) {
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN ||
+           (vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
+static UINT heldMods() {
+    UINT m = 0;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= MOD_CONTROL;
+    if (GetKeyState(VK_MENU) & 0x8000)    m |= MOD_ALT;
+    if (GetKeyState(VK_SHIFT) & 0x8000)   m |= MOD_SHIFT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= MOD_WIN;
+    return m;
+}
+
+static LRESULT CALLBACK keyBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case KB_SETHOTKEY:
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)wp);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case KB_GETHOTKEY:
+        return GetWindowLongPtrW(h, GWLP_USERDATA);
+    case WM_GETDLGCODE: {
+        const MSG* m = (const MSG*)lp;   // plain Tab still moves to the next control
+        if (m && m->message == WM_KEYDOWN && m->wParam == VK_TAB && !(heldMods() & (MOD_CONTROL | MOD_ALT)))
+            return DLGC_WANTCHARS;
+        return DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTCHARS;
+    }
+    case WM_LBUTTONDOWN:
+        SetFocus(h);
+        return 0;
+    case WM_SETFOCUS: case WM_KILLFOCUS: case WM_KEYUP: case WM_SYSKEYUP: case WM_ENABLE:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        UINT vk = (UINT)wp;
+        InvalidateRect(h, nullptr, FALSE);
+        if (isModifierVk(vk)) return 0;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((heldMods() << 16) | (vk & 0xFF)));
+        SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(h), EN_CHANGE), (LPARAM)h);
+        return 0;
+    }
+    case WM_CHAR: case WM_SYSCHAR: case WM_DEADCHAR: case WM_SYSDEADCHAR:
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        bool focus = GetFocus() == h;
+        fillSolid(dc, rc, g_pal.ctrl);
+        SetDCBrushColor(dc, focus ? g_pal.accent : g_pal.border);
+        FrameRect(dc, &rc, (HBRUSH)GetStockObject(DC_BRUSH));
+        if (focus) { RECT in = { rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1 }; FrameRect(dc, &in, (HBRUSH)GetStockObject(DC_BRUSH)); }
+        UINT hk = (UINT)GetWindowLongPtrW(h, GWLP_USERDATA), mods = focus ? heldMods() : 0;
+        std::wstring text;
+        COLORREF col = g_pal.text;
+        if (mods) text = u2w(modsPrefix(mods)) + L"...";
+        else if (hk & 0xFFFF) text = u2w(hotkeyToString(hk));
+        else { text = focus ? L"Press keys..." : L"None"; col = g_pal.textDim; }
+        HGDIOBJ oldFont = SelectObject(dc, g_font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, col);
+        RECT tr = rc;
+        tr.left += S(6);
+        DrawTextW(dc, text.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, oldFont);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static BOOL CALLBACK themeChildProc(HWND h, LPARAM) {
+    wchar_t cls[32];
+    GetClassNameW(h, cls, 32);
+    if (!lstrcmpiW(cls, L"ComboBox") || !lstrcmpiW(cls, L"Edit"))
+        pSetWindowTheme(h, g_dark ? L"DarkMode_CFD" : nullptr, nullptr);
+    else if (!lstrcmpiW(cls, L"ListBox"))
+        pSetWindowTheme(h, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);   // dark scrollbar
+    return TRUE;
+}
+
+static void applyTheme() {
+    loadPalette();
+    if (!g_editor) return;
+    if (!pSetWindowTheme) {
+        if (HMODULE ux = LoadLibraryW(L"uxtheme.dll"))
+            pSetWindowTheme = (PFN_SetWindowTheme)(void*)GetProcAddress(ux, "SetWindowTheme");
+    }
+    BOOL dark = g_dark;   // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 on Windows 10 2004+, 19 before
+    if (FAILED(DwmSetWindowAttribute(g_editor, 20, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(g_editor, 19, &dark, sizeof(dark));
+    setMenuDarkMode(g_dark);
+    if (pSetWindowTheme) EnumChildWindows(g_editor, themeChildProc, 0);
+    if (g_legend)
+        SetWindowTextW(g_legend, g_dark ? L"Blue = drawn, white = component, red = erased."
+                                        : L"Blue = drawn, black = component, pink = erased.");
+    SetWindowPos(g_editor, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(g_editor, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
 }
 
 static void setCheck(HWND h, bool v) { SendMessageW(h, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0); }
@@ -928,28 +1328,6 @@ static std::wstring getText(HWND h) {
     GetWindowTextW(h, &s[0], n + 1);
     s.resize(n);
     return s;
-}
-
-// hotkey control <-> stored hotkey
-static bool isExtendedVk(UINT vk) {
-    return (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE || vk == VK_NUMLOCK;
-}
-static WORD toHkCtrl(UINT hk) {
-    UINT mods = hk >> 16, vk = hk & 0xFF;
-    BYTE f = 0;
-    if (mods & MOD_SHIFT)   f |= HOTKEYF_SHIFT;
-    if (mods & MOD_CONTROL) f |= HOTKEYF_CONTROL;
-    if (mods & MOD_ALT)     f |= HOTKEYF_ALT;
-    if (isExtendedVk(vk))   f |= HOTKEYF_EXT;
-    return MAKEWORD(vk, f);
-}
-static UINT fromHkCtrl(WORD w) {
-    UINT vk = LOBYTE(w), f = HIBYTE(w), mods = 0;
-    if (!vk) return 0;
-    if (f & HOTKEYF_SHIFT)   mods |= MOD_SHIFT;
-    if (f & HOTKEYF_CONTROL) mods |= MOD_CONTROL;
-    if (f & HOTKEYF_ALT)     mods |= MOD_ALT;
-    return (mods << 16) | vk;
 }
 
 // ---------------------------------------------------------------- hotkey registration
@@ -1034,7 +1412,7 @@ static void populateCompPanel() {
     Component c = has ? cur().comps[g_selComp] : makeComponent(0);
     const TypeInfo& t = kTypes[c.type];
     ++g_populating;
-    SetWindowTextW(g_compGroup, has ? (std::wstring(L"Selected component: ") + t.name).c_str() : L"Selected component: none");
+    setGroupTitle(g_compGroupIdx, has ? std::wstring(L"Selected component: ") + t.name : L"Selected component: none");
     setCheck(g_cEnabled, c.enabled);
     setCheck(g_cSubtract, c.subtract);
     for (int i = 0; i < 3; ++i) {
@@ -1081,7 +1459,7 @@ static void populateOffsets() {
 
 static void populateHotkeys() {
     ++g_populating;
-    for (int i = 0; i < HK_COUNT; ++i) SendMessageW(g_hkCtrl[i], HKM_SETHOTKEY, toHkCtrl(g_set.hk[i]), 0);
+    for (int i = 0; i < HK_COUNT; ++i) SendMessageW(g_hkCtrl[i], KB_SETHOTKEY, g_set.hk[i], 0);
     --g_populating;
 }
 
@@ -1434,11 +1812,11 @@ static void paintGrid(HWND h, HDC dc) {
         SetDCBrushColor(mem, col);
         FillRect(mem, &q, dcBrush);
     };
-    fill(0, 0, rc.right, rc.bottom, GetSysColor(COLOR_BTNFACE));
+    fill(0, 0, rc.right, rc.bottom, g_pal.bg);
 
     GridGeo g = gridGeo(h);
     int gap = g.cell >= 5 ? 1 : 0;
-    fill(g.ox, g.oy, g.ox + g.cell * g.n, g.oy + g.cell * g.n, RGB(205, 205, 205));
+    fill(g.ox, g.oy, g.ox + g.cell * g.n, g.oy + g.cell * g.n, g_pal.gridGap);
     const auto& px = cur().pixels;
     for (int y = -g.R; y <= g.R; ++y) {
         for (int x = -g.R; x <= g.R; ++x) {
@@ -1446,9 +1824,9 @@ static void paintGrid(HWND h, HDC dc) {
             bool base = g_base.count(k) != 0;
             auto it = px.find(k);
             COLORREF col;
-            if (it != px.end()) col = it->second ? RGB(0, 105, 230) : (base ? RGB(255, 160, 160) : RGB(255, 228, 228));
-            else if (base) col = RGB(40, 40, 40);
-            else col = (x == 0 || y == 0) ? RGB(232, 238, 250) : RGB(255, 255, 255);
+            if (it != px.end()) col = it->second ? g_pal.gridDrawn : (base ? g_pal.gridErasedOn : g_pal.gridErasedOff);
+            else if (base) col = g_pal.gridOn;
+            else col = (x == 0 || y == 0) ? g_pal.gridAxis : g_pal.gridEmpty;
             int l = g.ox + (x + g.R) * g.cell, t = g.oy + (y + g.R) * g.cell;
             fill(l, t, l + g.cell - gap, t + g.cell - gap, col);
         }
@@ -1456,9 +1834,11 @@ static void paintGrid(HWND h, HDC dc) {
     if (g.cell >= 3) {   // centre pixel marker
         int l = g.ox + g.R * g.cell, t = g.oy + g.R * g.cell;
         RECT q = { l - 1, t - 1, l + g.cell, t + g.cell };
-        SetDCBrushColor(mem, RGB(230, 30, 30));
+        SetDCBrushColor(mem, g_pal.gridCentre);
         FrameRect(mem, &q, dcBrush);
     }
+    SetDCBrushColor(mem, g_pal.border);
+    FrameRect(mem, &rc, dcBrush);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -1636,7 +2016,7 @@ static void onCommand(int id, int code) {
     }
     if (id >= ID_HK && id < ID_HK + HK_COUNT && code == EN_CHANGE) {
         int i = id - ID_HK;
-        g_set.hk[i] = fromHkCtrl((WORD)SendMessageW(g_hkCtrl[i], HKM_GETHOTKEY, 0, 0));
+        g_set.hk[i] = (UINT)SendMessageW(g_hkCtrl[i], KB_GETHOTKEY, 0, 0);
         saveSettings();
         setStatus(std::wstring(kHk[i].label) + L": " + u2w(hotkeyToString(g_set.hk[i])) + L" (active once you leave the box)");
         return;
@@ -1704,6 +2084,13 @@ static void onCommand(int id, int code) {
         break;
     case ID_OVERLAY_VISIBLE: setOverlayVisible(getCheck(g_overlayCheck)); break;
     case ID_START_HIDDEN:    g_set.startHidden = getCheck(g_startHidden); saveSettings(); break;
+    case ID_THEME:
+        if (code == CBN_SELCHANGE) {
+            g_set.theme = std::clamp((int)SendMessageW(g_themeCombo, CB_GETCURSEL, 0, 0), 0, 2);
+            saveSettings();
+            applyTheme();
+        }
+        break;
 
     case ID_VIEW_RADIUS:
         if (code == EN_CHANGE) { g_viewRadius = getInt(g_viewR, 0, 150, 0); InvalidateRect(g_grid, nullptr, FALSE); }
@@ -1777,6 +2164,47 @@ static LRESULT CALLBACK editorProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOW:
         showEditor();
         return 0;
+    case WM_APP_QUIT:
+        requestQuit();
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect((HDC)wp, &rc, g_bgBrush);
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        paintGroups(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetTextColor((HDC)wp, g_pal.text);
+        SetBkColor((HDC)wp, g_pal.bg);
+        return (LRESULT)g_bgBrush;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        if (!g_dark) break;
+        SetTextColor((HDC)wp, g_pal.text);
+        SetBkColor((HDC)wp, g_pal.ctrl);
+        return (LRESULT)g_ctrlBrush;
+    case WM_NOTIFY: {
+        const NMHDR* nh = (const NMHDR*)lp;
+        if (nh->code == NM_CUSTOMDRAW) {
+            wchar_t cls[16];
+            GetClassNameW(nh->hwndFrom, cls, 16);
+            if (!lstrcmpiW(cls, L"Button")) return customDrawButton((const NMCUSTOMDRAW*)lp);
+        }
+        break;
+    }
+    case WM_SETTINGCHANGE:   // Windows switched between light and dark apps
+        if (g_set.theme == 0 && lp && !lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet")) applyTheme();
+        break;
+    case WM_SYSCOLORCHANGE:
+        applyTheme();
+        break;
     default:
         if (msg == g_taskbarCreated && g_taskbarCreated) { addTray(); return 0; }
     }
@@ -1787,7 +2215,19 @@ static LRESULT CALLBACK editorProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static bool handleEditorKeys(const MSG& msg) {
     if (msg.message != WM_KEYDOWN || !g_editor) return false;
     if (msg.hwnd != g_editor && !IsChild(g_editor, msg.hwnd)) return false;
-    if (!(GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return false;
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    WPARAM k = msg.wParam;
+    if (!ctrl && !alt && (k == VK_UP || k == VK_DOWN || k == VK_PRIOR || k == VK_NEXT)) {
+        for (auto& n : g_numEdits) {
+            if (n.edit != msg.hwnd) continue;
+            int d = (k == VK_UP || k == VK_PRIOR) ? 1 : -1;
+            if (k == VK_PRIOR || k == VK_NEXT || (GetKeyState(VK_SHIFT) & 0x8000)) d *= 10;
+            stepEdit(n.edit, n.lo, n.hi, d);
+            return true;
+        }
+        return false;
+    }
+    if (!ctrl || alt) return false;
     for (int i = 0; i < HK_COUNT; ++i) if (msg.hwnd == g_hkCtrl[i]) return false;
     if (msg.wParam == 'Z' && msg.hwnd != g_nameEdit) { undoRedo(true); return true; }
     if (msg.wParam == 'Y' && msg.hwnd != g_nameEdit) { undoRedo(false); return true; }
@@ -1838,23 +2278,30 @@ static void createEditor() {
     g_font = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
+    loadPalette();
+
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = editorProc;
     wc.hInstance = g_inst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.hIcon = g_icon;
+    wc.hIcon = g_iconBig;
+    wc.hIconSm = g_icon;
     wc.lpszClassName = L"CrosshairEditorWnd";
     RegisterClassExW(&wc);
 
-    WNDCLASSEXW gc{ sizeof(gc) };
-    gc.lpfnWndProc = gridProc;
-    gc.hInstance = g_inst;
-    gc.hCursor = LoadCursor(nullptr, IDC_CROSS);
-    gc.lpszClassName = L"CrosshairPixelGrid";
-    RegisterClassExW(&gc);
+    auto childClass = [](const wchar_t* name, WNDPROC proc, LPCWSTR cursor) {
+        WNDCLASSEXW c{ sizeof(c) };
+        c.lpfnWndProc = proc;
+        c.hInstance = g_inst;
+        c.hCursor = LoadCursor(nullptr, cursor);
+        c.lpszClassName = name;
+        RegisterClassExW(&c);
+    };
+    childClass(L"CrosshairPixelGrid", gridProc, IDC_CROSS);
+    childClass(L"CrosshairSpin", spinProc, IDC_ARROW);
+    childClass(L"CrosshairKeyBox", keyBoxProc, IDC_IBEAM);
 
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT r = { 0, 0, S(1010), S(690) };
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_CONTROLPARENT);
     g_editor = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Crosshair Editor", style,
@@ -1882,7 +2329,7 @@ static void createEditor() {
     button(L"Move up", 216, 242, 104, ID_COMP_UP);
     button(L"Move down", 216, 271, 104, ID_COMP_DOWN);
 
-    g_compGroup = group(L"Selected component", 10, 312, 320, 200);
+    g_compGroupIdx = group(L"Selected component", 10, 312, 320, 200);
     g_cEnabled = check(L"Enabled", 20, 332, 90, ID_COMP_ENABLED);
     g_cSubtract = check(L"Subtract (erase pixels)", 120, 332, 200, ID_COMP_SUBTRACT);
     g_compCtrls = { g_cEnabled, g_cSubtract };
@@ -1901,17 +2348,21 @@ static void createEditor() {
         g_compCtrls.push_back(g_cFlag[i]);
     }
 
-    group(L"Display", 10, 518, 320, 122);
-    label(L"Monitor", 20, 540, 58);
-    g_monitorCombo = combo(80, 538, 240, ID_MONITOR);
-    label(L"Update rate (fps, 0 = every refresh)", 20, 570, 210);
-    g_fps = numEdit(240, 568, 80, ID_FPS, 0, 1000);
-    g_overlayCheck = check(L"Show crosshair", 20, 600, 140, ID_OVERLAY_VISIBLE);
-    g_startHidden = check(L"Start hidden in tray", 170, 600, 150, ID_START_HIDDEN);
+    group(L"Display", 10, 518, 320, 128);
+    label(L"Monitor", 20, 536, 58);
+    g_monitorCombo = combo(80, 534, 240, ID_MONITOR);
+    label(L"Update rate (fps, 0 = every refresh)", 20, 562, 210);
+    g_fps = numEdit(240, 560, 80, ID_FPS, 0, 1000);
+    label(L"Theme", 20, 588, 58);
+    g_themeCombo = combo(80, 586, 240, ID_THEME);
+    for (const wchar_t* t : { L"System (follow Windows)", L"Light", L"Dark" })
+        SendMessageW(g_themeCombo, CB_ADDSTRING, 0, (LPARAM)t);
+    g_overlayCheck = check(L"Show crosshair", 20, 614, 140, ID_OVERLAY_VISIBLE);
+    g_startHidden = check(L"Start hidden in tray", 170, 614, 150, ID_START_HIDDEN);
 
     // ---- column 2: pixel editor, position
     group(L"Pixels", 340, 6, 380, 542);
-    g_grid = mk(L"CrosshairPixelGrid", L"", 0, 350, 26, 360, 360, ID_GRID, WS_EX_CLIENTEDGE);
+    g_grid = mk(L"CrosshairPixelGrid", L"", 0, 350, 26, 360, 360, ID_GRID);
     g_hover = label(L"Hover the grid to see coordinates. Red square = centre pixel.", 350, 390, 360);
     g_mirrorH = check(L"Mirror left / right", 350, 414, 160, ID_MIRROR_H);
     g_mirrorV = check(L"Mirror up / down", 520, 414, 160, ID_MIRROR_V);
@@ -1929,7 +2380,7 @@ static void createEditor() {
     label(L"Y", 512, 580, 14);
     g_offY = numEdit(528, 578, 90, ID_OFF_Y, -kMaxOffset, kMaxOffset);
     button(L"Centre", 628, 577, 82, ID_CENTRE);
-    label(L"Blue = drawn, black = component, pink = erased.", 350, 608, 360);
+    g_legend = label(L"", 350, 608, 360);
 
     // ---- column 3: effects, hotkeys
     group(L"Effects (applied top to bottom)", 730, 6, 270, 294);
@@ -1951,7 +2402,7 @@ static void createEditor() {
     for (int i = 0; i < HK_COUNT; ++i) {
         int y = 326 + i * 25;
         label(kHk[i].label, 740, y, 110);
-        g_hkCtrl[i] = mk(HOTKEY_CLASSW, L"", WS_TABSTOP, 850, y, 118, 22, ID_HK + i, WS_EX_CLIENTEDGE);
+        g_hkCtrl[i] = mk(L"CrosshairKeyBox", L"", WS_TABSTOP, 850, y, 118, 22, ID_HK + i);
         button(L"\u00D7", 970, y, 22, ID_HK_CLEAR + i, 22);
     }
     button(L"Reset to defaults", 740, 326 + HK_COUNT * 25 + 4, 130, ID_HK_DEFAULTS);
@@ -1968,6 +2419,8 @@ static void createEditor() {
     setInt(g_viewR, 0);
     setCheck(g_overlayCheck, g_visible);
     setCheck(g_startHidden, g_set.startHidden);
+    SendMessageW(g_themeCombo, CB_SETCURSEL, std::clamp(g_set.theme, 0, 2), 0);
+    applyTheme();
     g_ready = true;
 }
 
@@ -2037,7 +2490,15 @@ static void loadAllPresets() {
     if (!fs::exists(g_iniPath)) saveSettings();
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+static bool dirWritable(const fs::path& d) {
+    HANDLE h = CreateFileW((d / L"crosshair.write-test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_inst = inst;
     HANDLE single = CreateMutexW(nullptr, TRUE, L"InvertCrosshairOverlay_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2059,9 +2520,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    fs::path dir = fs::path(exe).parent_path();
-    g_iniPath = dir / L"crosshair.ini";
-    g_presetDir = dir / L"presets";
+    // Settings and presets next to the exe (portable), or in %APPDATA%\Crosshair when the exe
+    // lives somewhere read-only such as Program Files.
+    fs::path dataDir = fs::path(exe).parent_path();
+    wchar_t appData[MAX_PATH];
+    if (!dirWritable(dataDir) && GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
+        dataDir = fs::path(appData) / L"Crosshair";
+        std::error_code ec;
+        fs::create_directories(dataDir, ec);
+    }
+    g_iniPath = dataDir / L"crosshair.ini";
+    g_presetDir = dataDir / L"presets";
 
     enableVisualStyles();
 
@@ -2100,13 +2569,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     loadAllPresets();
 
-    g_icon = makeIcon(GetSystemMetrics(SM_CXSMICON) >= 20 ? 32 : 16);
+    int smallIcon = GetSystemMetrics(SM_CXSMICON), bigIcon = GetSystemMetrics(SM_CXICON);
+    g_icon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, smallIcon, smallIcon, 0);   // from crosshair.rc
+    g_iconBig = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, bigIcon, bigIcon, 0);
+    if (!g_icon) g_icon = makeIcon(smallIcon >= 20 ? 32 : 16);
+    if (!g_iconBig) g_iconBig = makeIcon(32);
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     createEditor();
     addTray();
     rebuildOverlay();
     registerHotkeys();
-    if (!g_set.startHidden) showEditor();
+    bool trayOnly = cmdLine && (wcsstr(cmdLine, L"/tray") || wcsstr(cmdLine, L"--tray"));
+    if (!g_set.startHidden && !trayOnly) showEditor();
     setStatus(L"Preset: " + cur().name + L".  Closing this window keeps the crosshair running in the tray.");
 
     timeBeginPeriod(1);
