@@ -4,7 +4,9 @@
 // that shows the screen content directly underneath it, run through a colour matrix
 // (invert, hue shift, adaptive max contrast, ...). The window is clipped (SetWindowRgn) to the exact
 // crosshair pixel mask, so every crosshair pixel is a transformed copy of whatever is behind
-// it. Refreshes once per compositor frame (DwmFlush), i.e. at your monitor's refresh rate.
+// it. Refreshes once per compositor frame (DwmFlush), i.e. at your monitor's refresh rate, on
+// its own high-priority thread so the editor can never hold it up. "Refresh overlay" (button,
+// hotkey or tray menu) rebuilds the magnifier from scratch if it ever freezes or lags.
 //
 // The crosshair is built from components (cross, dot, circle, box, diagonal X) plus a layer
 // of hand-drawn pixel edits on top. Everything is edited live in the editor window, saved as
@@ -60,6 +62,8 @@
 #include <climits>
 #include <cmath>
 #include <cwchar>
+#include <atomic>
+#include <mutex>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
@@ -71,6 +75,8 @@
 #endif
 
 namespace fs = std::filesystem;
+
+#define CROSSHAIR_VERSION L"2.2"
 
 // ---------------------------------------------------------------- Magnification API
 // Loaded from Magnification.dll at runtime, so no SDK header or import library is needed
@@ -257,7 +263,7 @@ static Preset defaultPreset(const std::wstring& name) {
 
 // ---------------------------------------------------------------- hotkeys (definitions)
 
-enum { HK_TOGGLE, HK_EDITOR, HK_NEXT, HK_PREV, HK_LEFT, HK_RIGHT, HK_UP, HK_DOWN, HK_SAVE, HK_RELOAD, HK_QUIT, HK_COUNT };
+enum { HK_TOGGLE, HK_EDITOR, HK_NEXT, HK_PREV, HK_LEFT, HK_RIGHT, HK_UP, HK_DOWN, HK_SAVE, HK_RELOAD, HK_REFRESH, HK_QUIT, HK_COUNT };
 struct HkDef { const char* key; const wchar_t* label; UINT vk; bool repeat; };
 static const HkDef kHk[HK_COUNT] = {
     { "key_toggle", L"Toggle crosshair",      'H',      false },
@@ -270,6 +276,7 @@ static const HkDef kHk[HK_COUNT] = {
     { "key_down",   L"Nudge down",            VK_DOWN,  true  },
     { "key_save",   L"Save preset",           'S',      false },
     { "key_reload", L"Reload preset",         'R',      false },
+    { "key_refresh", L"Refresh overlay",      'U',      false },
     { "key_quit",   L"Quit",                  'Q',      false },
 };
 // A hotkey is stored as (MOD_* flags << 16) | virtual-key code; 0 = unassigned.
@@ -773,9 +780,7 @@ static HINSTANCE g_inst;
 static std::vector<Preset> g_presets;
 static int g_cur = 0;
 static PxSet g_base, g_final;   // component layer / final mask of the current preset
-static HWND  g_host = nullptr, g_mag = nullptr;
-static RECT  g_src = {};
-static bool  g_visible = true, g_hasPixels = false, g_hkRegistered = false;
+static bool  g_visible = true, g_hkRegistered = false;
 static HICON g_icon = nullptr, g_iconBig = nullptr;
 
 static Preset& cur() { return g_presets[g_cur]; }
@@ -811,54 +816,105 @@ enum {
     ID_MONITOR, ID_FPS, ID_OVERLAY_VISIBLE, ID_START_HIDDEN, ID_THEME,
     ID_GRID, ID_MIRROR_H, ID_MIRROR_V, ID_VIEW_RADIUS, ID_CLEAR_PIXELS, ID_BAKE, ID_UNDO, ID_REDO,
     ID_OFF_X, ID_OFF_Y, ID_CENTRE,
-    ID_HK_DEFAULTS, ID_HIDE, ID_QUIT,
+    ID_HK_DEFAULTS, ID_HIDE, ID_QUIT, ID_REFRESH, ID_TOGGLE_OVERLAY,
     ID_FX_CHECK = 300, ID_FX_VAL = 320, ID_FX_RGB = 340,
     ID_HK = 400, ID_HK_CLEAR = 450,
-    ID_TRAY_OPEN = 900, ID_TRAY_TOGGLE, ID_TRAY_QUIT, ID_TRAY_PRESET = 1000,
+    ID_TRAY_OPEN = 900, ID_TRAY_TOGGLE, ID_TRAY_QUIT, ID_TRAY_REFRESH, ID_TRAY_PRESET = 1000,
 };
 
 static void setStatus(const std::wstring& s) { if (g_status) SetWindowTextW(g_status, s.c_str()); }
 
-// ---------------------------------------------------------------- overlay
+// ---------------------------------------------------------------- overlay thread
+// The overlay (host window + magnifier) lives on its own high-priority thread with its own
+// frame loop. The editor only publishes a new mask / effect / position into g_ov; the thread
+// picks it up on its next frame. "Refresh overlay" destroys and recreates the magnifier.
 
-static void refreshMag() {
-    if (!g_visible || !g_hasPixels) return;
-    PHYSICAL_PIXELS;
-    MagSetWindowSource(g_mag, g_src);
-    InvalidateRect(g_mag, nullptr, FALSE);
-}
+struct OverlayShared {
+    std::mutex lock;
+    std::vector<Px> pixels;    // final mask, relative to the centre
+    MagColorEffect effect{};
+    int monitor = 0, offX = 0, offY = 0, fps = 0;
+    bool visible = true;
+    unsigned version = 0;      // bumped on every change
+};
+static OverlayShared g_ov;
+static HANDLE g_ovThread = nullptr;
+static std::atomic<bool> g_ovRun{ true }, g_ovRecreate{ false }, g_ovForceApply{ false }, g_ovHealthy{ false };
+static std::atomic<int> g_ovFps{ 0 };
+static std::atomic<DWORD> g_ovLastFrame{ 0 };
 
+// Called on the editor thread after every change: recompute the mask and hand it over.
 static void rebuildOverlay() {
-    PHYSICAL_PIXELS;
     g_base = componentLayer(cur());
     g_final = finalLayer(cur(), g_base);
     if (g_grid) InvalidateRect(g_grid, nullptr, FALSE);
-
     MagColorEffect e = buildEffect(cur().fx);
-    MagSetColorEffect(g_mag, &e);
+    std::vector<Px> v(g_final.begin(), g_final.end());
+    std::lock_guard<std::mutex> lk(g_ov.lock);
+    g_ov.pixels.swap(v);
+    g_ov.effect = e;
+    g_ov.monitor = g_set.monitor;
+    g_ov.offX = cur().offX;
+    g_ov.offY = cur().offY;
+    g_ov.fps = g_set.fps;
+    g_ov.visible = g_visible;
+    ++g_ov.version;
+}
 
-    g_hasPixels = !g_final.empty();
-    if (!g_hasPixels) { ShowWindow(g_host, SW_HIDE); return; }
+static LRESULT CALLBACK hostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_DISPLAYCHANGE:
+    case WM_DPICHANGED:
+        g_ovForceApply = true;   // monitor layout changed: recompute the position
+        return 0;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+struct OverlayWindows { HWND host = nullptr, mag = nullptr; };
+
+static bool createOverlayWindows(OverlayWindows& w) {
+    w.host = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                             L"InvertCrosshairHost", L"Crosshair", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_inst, nullptr);
+    if (!w.host) return false;
+    SetLayeredWindowAttributes(w.host, 0, 255, LWA_ALPHA);
+    w.mag = CreateWindowExW(0, kMagClass, L"CrosshairMag", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, w.host, nullptr, g_inst, nullptr);
+    if (!w.mag) return false;
+    MagTransform identity = {};
+    identity.v[0][0] = identity.v[1][1] = identity.v[2][2] = 1.0f;
+    MagSetWindowTransform(w.mag, &identity);
+    HWND exclude[] = { w.host };   // don't capture ourselves, or the effect would apply to our own output
+    MagSetWindowFilterList(w.mag, kFilterExclude, 1, exclude);
+    return true;
+}
+static void destroyOverlayWindows(OverlayWindows& w) {
+    if (w.host) DestroyWindow(w.host);   // also destroys the magnifier child
+    w = OverlayWindows();
+}
+
+// Positions and clips the host window. Returns true if the crosshair is on screen.
+static bool applyOverlay(const OverlayWindows& w, std::vector<Px>& v, MagColorEffect eff, int monitor,
+                         int offX, int offY, bool visible, RECT& src) {
+    MagSetColorEffect(w.mag, &eff);
+    if (v.empty() || !visible) { ShowWindow(w.host, SW_HIDE); return false; }
 
     int minX = INT_MAX, minY = INT_MAX, maxX = INT_MIN, maxY = INT_MIN;
-    for (auto& q : g_final) {
+    for (auto& q : v) {
         minX = std::min(minX, q.first);  maxX = std::max(maxX, q.first);
         minY = std::min(minY, q.second); maxY = std::max(maxY, q.second);
     }
-    int w = maxX - minX + 1, h = maxY - minY + 1;
-
-    RECT mon = monitorRect(g_set.monitor);
+    int wd = maxX - minX + 1, ht = maxY - minY + 1;
+    RECT mon = monitorRect(monitor);
     // Centre pixel of the monitor: for a 1920x1080 screen this is (960, 540).
-    int sx = mon.left + (mon.right - mon.left) / 2 + cur().offX;
-    int sy = mon.top + (mon.bottom - mon.top) / 2 + cur().offY;
-    int x = sx + minX, y = sy + minY;
-
-    g_src = { x, y, x + w, y + h };
-    SetWindowPos(g_host, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-    SetWindowPos(g_mag, nullptr, 0, 0, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    int x = mon.left + (mon.right - mon.left) / 2 + offX + minX;
+    int y = mon.top + (mon.bottom - mon.top) / 2 + offY + minY;
+    src = { x, y, x + wd, y + ht };
+    SetWindowPos(w.host, HWND_TOPMOST, x, y, wd, ht, SWP_NOACTIVATE);
+    SetWindowPos(w.mag, nullptr, 0, 0, wd, ht, SWP_NOZORDER | SWP_NOACTIVATE);
 
     // Clip the window to exactly the mask pixels (one rect per horizontal run).
-    std::vector<Px> v(g_final.begin(), g_final.end());
     std::sort(v.begin(), v.end(), [](const Px& a, const Px& b) {
         return a.second != b.second ? a.second < b.second : a.first < b.first;
     });
@@ -872,33 +928,133 @@ static void rebuildOverlay() {
         DeleteObject(run);
         i = j;
     }
-    SetWindowRgn(g_host, rgn, TRUE);   // the system now owns rgn
-
-    ShowWindow(g_host, g_visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-    refreshMag();
+    SetWindowRgn(w.host, rgn, TRUE);   // the system now owns rgn
+    ShowWindow(w.host, SW_SHOWNOACTIVATE);
+    return true;
 }
 
-static LRESULT CALLBACK hostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_DISPLAYCHANGE:
-    case WM_DPICHANGED:
-        if (!g_presets.empty()) rebuildOverlay();
-        return 0;
-    case WM_NCHITTEST:
-        return HTTRANSPARENT;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+static DWORD WINAPI overlayThread(LPVOID startedEvent) {
+    PHYSICAL_PIXELS;
+    // Stay smooth while a game keeps the CPU busy: high thread priority plus the MMCSS "Games" class.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    typedef HANDLE (WINAPI *PFN_AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+    if (HMODULE avrt = LoadLibraryW(L"avrt.dll")) {
+        auto avSet = (PFN_AvSetMmThreadCharacteristicsW)(void*)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
+        DWORD taskIndex = 0;
+        if (avSet) avSet(L"Games", &taskIndex);
     }
-    return DefWindowProc(h, msg, wp, lp);
+
+    OverlayWindows w;
+    g_ovHealthy = MagInitialize() && createOverlayWindows(w);
+    SetEvent((HANDLE)startedEvent);
+    timeBeginPeriod(1);
+
+    unsigned seen = ~0u;
+    std::vector<Px> pixels;
+    MagColorEffect effect{};
+    int monitor = 0, offX = 0, offY = 0, fps = 0;
+    bool visible = true, shown = false;
+    RECT src = {};
+    DWORD lastTopmost = GetTickCount(), fpsTick = lastTopmost, frames = 0;
+
+    while (g_ovRun) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (g_ovRecreate.exchange(false)) {
+            destroyOverlayWindows(w);
+            MagUninitialize();
+            g_ovHealthy = MagInitialize() && createOverlayWindows(w);
+            seen = ~0u;
+        }
+        if (g_ovForceApply.exchange(false)) seen = ~0u;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(g_ov.lock);
+            if (g_ov.version != seen) {
+                seen = g_ov.version;
+                pixels = g_ov.pixels;
+                effect = g_ov.effect;
+                monitor = g_ov.monitor; offX = g_ov.offX; offY = g_ov.offY;
+                fps = g_ov.fps; visible = g_ov.visible;
+                changed = true;
+            }
+        }
+        if (changed && g_ovHealthy) shown = applyOverlay(w, pixels, effect, monitor, offX, offY, visible, src);
+        if (shown && g_ovHealthy) {
+            MagSetWindowSource(w.mag, src);
+            InvalidateRect(w.mag, nullptr, FALSE);
+            UpdateWindow(w.mag);   // render now, right after the vblank, instead of on a later frame
+        }
+
+        DWORD now = GetTickCount();
+        // Games sometimes push themselves above other topmost windows; reassert periodically.
+        if (shown && now - lastTopmost > 500) {
+            SetWindowPos(w.host, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+            lastTopmost = now;
+        }
+        ++frames;
+        if (now - fpsTick >= 500) {
+            g_ovFps = (int)(frames * 1000 / (now - fpsTick));
+            frames = 0;
+            fpsTick = now;
+        }
+        g_ovLastFrame = now;
+
+        if (fps > 0) Sleep(std::max(1, 1000 / fps));
+        else if (FAILED(DwmFlush())) Sleep(1);   // wait for the next composed frame
+    }
+    timeEndPeriod(1);
+    destroyOverlayWindows(w);
+    MagUninitialize();
+    return 0;
+}
+
+static bool startOverlay() {
+    WNDCLASSEXW wc{ sizeof(wc) };
+    wc.lpfnWndProc = hostProc;
+    wc.hInstance = g_inst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"InvertCrosshairHost";
+    RegisterClassExW(&wc);
+    HANDLE started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_ovRun = true;
+    g_ovThread = CreateThread(nullptr, 0, overlayThread, started, 0, nullptr);
+    if (g_ovThread) WaitForSingleObject(started, 10000);
+    CloseHandle(started);
+    return g_ovThread && g_ovHealthy;
+}
+static void stopOverlay() {
+    if (!g_ovThread) return;
+    g_ovRun = false;
+    WaitForSingleObject(g_ovThread, 3000);
+    CloseHandle(g_ovThread);
+    g_ovThread = nullptr;
+}
+
+// Short state for the editor header. kind: 0 = fine, 1 = neutral, 2 = needs attention.
+static std::wstring overlayStatus(int& kind) {
+    DWORD age = GetTickCount() - g_ovLastFrame;
+    if (!g_ovThread)            { kind = 1; return L"Overlay off"; }
+    if (!g_ovHealthy)           { kind = 2; return L"Overlay error \u00B7 press Refresh"; }
+    if (age > 1500)             { kind = 2; return L"Stalled \u00B7 press Refresh"; }
+    if (!g_visible)             { kind = 1; return L"Hidden"; }
+    if (g_final.empty())        { kind = 1; return L"Nothing to draw"; }
+    kind = 0;
+    return L"Live \u00B7 " + std::to_wstring(g_ovFps.load()) + L" fps";
 }
 
 // ---------------------------------------------------------------- editor helpers
 
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
+static const int kHeader = 48;   // height of the header bar; everything else sits below it
+static int g_yOff = 0;
+static std::set<HWND> g_outside, g_primary;   // controls on the window background / accent buttons
 
 static HWND mk(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0) {
-    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h),
+    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y + g_yOff), S(w), S(h),
                              g_editor, (HMENU)(INT_PTR)id, g_inst, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)g_font, FALSE);
     return c;
@@ -909,17 +1065,18 @@ static HWND check(const wchar_t* text, int x, int y, int w, int id) { return mk(
 static HWND combo(int x, int y, int w, int id) { return mk(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, x, y, w, 300, id); }
 
 // ---------------------------------------------------------------- theme
-// Standard controls mostly ignore colours, so in dark mode buttons and checkboxes are custom
-// drawn (NM_CUSTOMDRAW), group frames are painted by the editor itself, and the spin buttons
-// and hotkey boxes are small custom controls. Light mode keeps the native look.
+// Standard controls mostly ignore colours, so buttons and checkboxes are custom drawn
+// (NM_CUSTOMDRAW), sections are cards painted by the editor itself, and the spin buttons and
+// hotkey boxes are small custom controls. Same flat look in both themes.
 
 struct Palette {
-    COLORREF bg, text, textDim, ctrl, ctrlHot, ctrlPressed, border, accent, groupLine, spin, arrow;
+    COLORREF bg, card, text, textDim, ctrl, ctrlHot, ctrlPressed, border, accent, accentHot, accentPressed;
+    COLORREF groupLine, spin, arrow, okBg, okText, badBg, badText, mutedBg;
     COLORREF gridGap, gridEmpty, gridAxis, gridOn, gridDrawn, gridErasedOn, gridErasedOff, gridCentre;
 };
 static Palette g_pal;
 static bool g_dark = false;
-static HBRUSH g_bgBrush = nullptr, g_ctrlBrush = nullptr;
+static HBRUSH g_bgBrush = nullptr, g_ctrlBrush = nullptr, g_cardBrush = nullptr;
 
 typedef HRESULT (WINAPI *PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
 static PFN_SetWindowTheme pSetWindowTheme;
@@ -936,26 +1093,36 @@ static void loadPalette() {
     g_dark = g_set.theme == 2 || (g_set.theme == 0 && systemUsesDarkApps());
     Palette& p = g_pal;
     if (g_dark) {
-        p.bg = RGB(32, 32, 32);        p.text = RGB(235, 235, 235);    p.textDim = RGB(125, 125, 125);
-        p.ctrl = RGB(45, 45, 45);      p.ctrlHot = RGB(62, 62, 62);    p.ctrlPressed = RGB(80, 80, 80);
-        p.border = RGB(92, 92, 92);    p.accent = RGB(0, 120, 215);    p.groupLine = RGB(68, 68, 68);
-        p.spin = RGB(52, 52, 52);      p.arrow = RGB(205, 205, 205);
+        p.bg = RGB(28, 28, 28);        p.card = RGB(40, 40, 40);
+        p.text = RGB(235, 235, 235);   p.textDim = RGB(140, 140, 140);
+        p.ctrl = RGB(52, 52, 52);      p.ctrlHot = RGB(64, 64, 64);    p.ctrlPressed = RGB(78, 78, 78);
+        p.border = RGB(80, 80, 80);    p.groupLine = RGB(54, 54, 54);
+        p.accent = RGB(0, 120, 215);   p.accentHot = RGB(26, 138, 230); p.accentPressed = RGB(0, 98, 180);
+        p.spin = RGB(58, 58, 58);      p.arrow = RGB(205, 205, 205);
+        p.okBg = RGB(30, 60, 33);      p.okText = RGB(108, 203, 95);
+        p.badBg = RGB(72, 38, 38);     p.badText = RGB(255, 153, 164); p.mutedBg = RGB(52, 52, 52);
         p.gridGap = RGB(24, 24, 24);   p.gridEmpty = RGB(46, 46, 46);  p.gridAxis = RGB(54, 59, 74);
         p.gridOn = RGB(225, 225, 225); p.gridDrawn = RGB(40, 140, 255);
         p.gridErasedOn = RGB(170, 70, 70); p.gridErasedOff = RGB(88, 52, 52); p.gridCentre = RGB(255, 70, 70);
     } else {
-        p.bg = GetSysColor(COLOR_BTNFACE); p.text = GetSysColor(COLOR_WINDOWTEXT); p.textDim = GetSysColor(COLOR_GRAYTEXT);
-        p.ctrl = RGB(255, 255, 255);   p.ctrlHot = RGB(229, 241, 251); p.ctrlPressed = RGB(204, 228, 247);
-        p.border = RGB(160, 160, 160); p.accent = RGB(0, 120, 215);    p.groupLine = RGB(215, 215, 215);
-        p.spin = RGB(236, 236, 236);   p.arrow = RGB(90, 90, 90);
+        p.bg = RGB(243, 243, 243);     p.card = RGB(255, 255, 255);
+        p.text = RGB(27, 27, 27);      p.textDim = RGB(128, 128, 128);
+        p.ctrl = RGB(251, 251, 251);   p.ctrlHot = RGB(240, 245, 252); p.ctrlPressed = RGB(222, 233, 247);
+        p.border = RGB(205, 205, 205); p.groupLine = RGB(228, 228, 228);
+        p.accent = RGB(0, 103, 192);   p.accentHot = RGB(25, 117, 197); p.accentPressed = RGB(0, 84, 160);
+        p.spin = RGB(242, 242, 242);   p.arrow = RGB(90, 90, 90);
+        p.okBg = RGB(223, 246, 221);   p.okText = RGB(16, 124, 16);
+        p.badBg = RGB(253, 231, 233);  p.badText = RGB(196, 43, 28);   p.mutedBg = RGB(232, 232, 232);
         p.gridGap = RGB(205, 205, 205); p.gridEmpty = RGB(255, 255, 255); p.gridAxis = RGB(232, 238, 250);
         p.gridOn = RGB(40, 40, 40);    p.gridDrawn = RGB(0, 105, 230);
         p.gridErasedOn = RGB(255, 160, 160); p.gridErasedOff = RGB(255, 228, 228); p.gridCentre = RGB(230, 30, 30);
     }
     if (g_bgBrush) DeleteObject(g_bgBrush);
     if (g_ctrlBrush) DeleteObject(g_ctrlBrush);
+    if (g_cardBrush) DeleteObject(g_cardBrush);
     g_bgBrush = CreateSolidBrush(p.bg);
     g_ctrlBrush = CreateSolidBrush(p.ctrl);
+    g_cardBrush = CreateSolidBrush(p.card);
 }
 
 static DWORD windowsBuild() {
@@ -1006,7 +1173,7 @@ struct GroupBox { int x, y, w, h; std::wstring title; };
 static std::vector<GroupBox> g_groups;
 
 static int group(const wchar_t* text, int x, int y, int w, int h) {
-    g_groups.push_back({ x, y, w, h, text });
+    g_groups.push_back({ x, y + g_yOff, w, h, text });
     return (int)g_groups.size() - 1;
 }
 static void setGroupTitle(int i, const std::wstring& title) {
@@ -1016,32 +1183,73 @@ static void setGroupTitle(int i, const std::wstring& title) {
     RECT r = { S(g.x), S(g.y), S(g.x + g.w), S(g.y + 20) };
     InvalidateRect(g_editor, &r, TRUE);
 }
+static HFONT g_fontBold = nullptr, g_fontTitle = nullptr;
+
+// Sections are cards: a filled rounded panel with a semibold title inside the top edge.
 static void paintGroups(HDC dc) {
-    HGDIOBJ oldFont = SelectObject(dc, g_font);
-    TEXTMETRICW tm;
-    GetTextMetricsW(dc, &tm);
-    HPEN pen = CreatePen(PS_SOLID, 1, g_pal.groupLine);
-    HGDIOBJ oldPen = SelectObject(dc, pen), oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ oldFont = SelectObject(dc, g_fontBold);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, g_pal.text);
     for (auto& g : g_groups) {
         RECT r = { S(g.x), S(g.y), S(g.x + g.w), S(g.y + g.h) };
-        RoundRect(dc, r.left, r.top + tm.tmHeight / 2, r.right, r.bottom, S(6), S(6));
-        SIZE sz;
-        GetTextExtentPoint32W(dc, g.title.c_str(), (int)g.title.size(), &sz);
-        RECT tr = { r.left + S(6), r.top, r.left + S(14) + sz.cx, r.top + tm.tmHeight };
-        FillRect(dc, &tr, g_bgBrush);
-        TextOutW(dc, r.left + S(10), r.top, g.title.c_str(), (int)g.title.size());
+        fillRound(dc, r, g_pal.card, g_pal.groupLine, S(10));
+        TextOutW(dc, r.left + S(10), r.top + S(3), g.title.c_str(), (int)g.title.size());
     }
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
     SelectObject(dc, oldFont);
-    DeleteObject(pen);
 }
 
-// Dark-mode painting for push buttons and checkboxes (comctl32 v6 custom draw).
+// Header bar: app name, overlay status pill, current preset. Buttons on the right are controls.
+static std::wstring g_headerStatus;
+static int g_headerKind = -1;
+
+static void paintHeader(HDC dc) {
+    RECT rc;
+    GetClientRect(g_editor, &rc);
+    DrawIconEx(dc, S(14), S(12), g_iconBig, S(24), S(24), 0, nullptr, DI_NORMAL);
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, g_fontTitle);
+    SetTextColor(dc, g_pal.text);
+    TextOutW(dc, S(46), S(10), L"Crosshair", 9);
+    SIZE sz;
+    GetTextExtentPoint32W(dc, L"Crosshair", 9, &sz);
+    SelectObject(dc, g_font);
+    SetTextColor(dc, g_pal.textDim);
+    std::wstring ver = L"v" CROSSHAIR_VERSION;
+    TextOutW(dc, S(46) + sz.cx + S(6), S(17), ver.c_str(), (int)ver.size());
+
+    int kind = 1;
+    std::wstring st = overlayStatus(kind);
+    g_headerStatus = st;
+    g_headerKind = kind;
+    COLORREF bgc = kind == 0 ? g_pal.okBg : kind == 2 ? g_pal.badBg : g_pal.mutedBg;
+    COLORREF fgc = kind == 0 ? g_pal.okText : kind == 2 ? g_pal.badText : g_pal.textDim;
+    SelectObject(dc, g_fontBold);
+    GetTextExtentPoint32W(dc, st.c_str(), (int)st.size(), &sz);
+    RECT pill = { S(180), S(12), S(180) + sz.cx + S(32), S(36) };
+    fillRound(dc, pill, bgc, bgc, pill.bottom - pill.top);
+    int cy = (pill.top + pill.bottom) / 2, dot = S(4);
+    RECT dr = { pill.left + S(10), cy - dot, pill.left + S(10) + 2 * dot, cy + dot };
+    fillRound(dc, dr, fgc, fgc, 2 * dot);
+    SetTextColor(dc, fgc);
+    RECT tr = { pill.left + S(22), pill.top, pill.right, pill.bottom };
+    DrawTextW(dc, st.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SelectObject(dc, g_font);
+    SetTextColor(dc, g_pal.textDim);
+    std::wstring pre = g_presets.empty() ? L"" : L"Preset: " + cur().name + (cur().dirty ? L" *" : L"");
+    RECT pr = { pill.right + S(14), pill.top, S(760), pill.bottom };
+    DrawTextW(dc, pre.c_str(), -1, &pr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, oldFont);
+}
+static void invalidateHeader() {
+    if (!g_editor) return;
+    RECT r = { 0, 0, S(765), S(kHeader) };
+    InvalidateRect(g_editor, &r, TRUE);
+}
+
+// Flat push buttons and checkboxes in both themes (comctl32 v6 custom draw).
 static LRESULT customDrawButton(const NMCUSTOMDRAW* cd) {
-    if (!g_dark || cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
     HWND h = cd->hdr.hwndFrom;
     LONG type = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
     bool isCheck = type == BS_AUTOCHECKBOX || type == BS_CHECKBOX;
@@ -1057,7 +1265,8 @@ static LRESULT customDrawButton(const NMCUSTOMDRAW* cd) {
     HGDIOBJ oldFont = SelectObject(dc, g_font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, disabled ? g_pal.textDim : g_pal.text);
-    fillSolid(dc, rc, g_pal.bg);
+    COLORREF back = g_outside.count(h) ? g_pal.bg : g_pal.card;
+    fillSolid(dc, rc, back);
     if (isCheck) {
         bool checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
         int bs = S(14), top = (rc.top + rc.bottom - bs) / 2;
@@ -1078,9 +1287,15 @@ static LRESULT customDrawButton(const NMCUSTOMDRAW* cd) {
         RECT tr = rc;
         tr.left = box.right + S(6);
         DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    } else if (g_primary.count(h) && !disabled) {
+        COLORREF fill = pressed ? g_pal.accentPressed : hot ? g_pal.accentHot : g_pal.accent;
+        fillRound(dc, rc, fill, focus ? g_pal.text : fill, S(8));
+        SelectObject(dc, g_fontBold);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     } else {
-        COLORREF fill = disabled ? g_pal.bg : pressed ? g_pal.ctrlPressed : hot ? g_pal.ctrlHot : g_pal.ctrl;
-        fillRound(dc, rc, fill, focus ? g_pal.accent : g_pal.border, S(6));
+        COLORREF fill = disabled ? back : pressed ? g_pal.ctrlPressed : hot ? g_pal.ctrlHot : g_pal.ctrl;
+        fillRound(dc, rc, fill, focus ? g_pal.accent : g_pal.border, S(8));
         DrawTextW(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
     SelectObject(dc, oldFont);
@@ -1384,6 +1599,7 @@ static void updateTitle() {
     if (!g_editor) return;
     std::wstring t = L"Crosshair Editor - " + cur().name + (cur().dirty ? L" *" : L"");
     SetWindowTextW(g_editor, t.c_str());
+    invalidateHeader();
 }
 
 static void populatePresetCombo() {
@@ -1812,7 +2028,7 @@ static void paintGrid(HWND h, HDC dc) {
         SetDCBrushColor(mem, col);
         FillRect(mem, &q, dcBrush);
     };
-    fill(0, 0, rc.right, rc.bottom, g_pal.bg);
+    fill(0, 0, rc.right, rc.bottom, g_pal.card);
 
     GridGeo g = gridGeo(h);
     int gap = g.cell >= 5 ? 1 : 0;
@@ -1938,11 +2154,21 @@ static void toggleEditor() {
     else showEditor();
 }
 
+static HWND g_toggleBtn = nullptr;
+
 static void setOverlayVisible(bool v) {
     g_visible = v;
     if (g_overlayCheck) setCheck(g_overlayCheck, v);
-    ShowWindow(g_host, (g_visible && g_hasPixels) ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (g_toggleBtn) SetWindowTextW(g_toggleBtn, v ? L"Hide crosshair" : L"Show crosshair");
+    rebuildOverlay();
+    invalidateHeader();
     setStatus(v ? L"Crosshair shown." : L"Crosshair hidden.");
+}
+
+static void refreshOverlay() {
+    g_ovRecreate = true;   // the overlay thread rebuilds the magnifier on its next frame
+    rebuildOverlay();
+    setStatus(L"Overlay refreshed: the magnifier was recreated from scratch.");
 }
 
 static void requestQuit() {
@@ -1959,7 +2185,8 @@ static void requestQuit() {
     }
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (g_editor) { HWND e = g_editor; g_editor = nullptr; g_grid = nullptr; g_status = nullptr; DestroyWindow(e); }
-    DestroyWindow(g_host);
+    stopOverlay();
+    PostQuitMessage(0);
 }
 
 static void trayMenu() {
@@ -1967,6 +2194,7 @@ static void trayMenu() {
     bool edVis = g_editor && IsWindowVisible(g_editor);
     AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, edVis ? L"Hide editor" : L"Open editor");
     AppendMenuW(m, MF_STRING | (g_visible ? MF_CHECKED : 0), ID_TRAY_TOGGLE, L"Show crosshair");
+    AppendMenuW(m, MF_STRING, ID_TRAY_REFRESH, L"Refresh overlay");
     for (int i = 0; i < (int)g_presets.size() && i < 500; ++i)
         AppendMenuW(sub, MF_STRING | (i == g_cur ? MF_CHECKED : 0), ID_TRAY_PRESET + i, g_presets[i].name.c_str());
     AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Preset");
@@ -2003,6 +2231,7 @@ static void onHotkey(int i) {
     case HK_DOWN:   nudge(0, 1); break;
     case HK_SAVE:   savePresetIdx(g_cur); break;
     case HK_RELOAD: reloadPreset(); break;
+    case HK_REFRESH: refreshOverlay(); break;
     case HK_QUIT:   requestQuit(); break;
     }
 }
@@ -2080,7 +2309,7 @@ static void onCommand(int id, int code) {
         }
         break;
     case ID_FPS:
-        if (code == EN_CHANGE) { g_set.fps = getInt(g_fps, 0, 1000, g_set.fps); saveSettings(); }
+        if (code == EN_CHANGE) { g_set.fps = getInt(g_fps, 0, 1000, g_set.fps); saveSettings(); rebuildOverlay(); }
         break;
     case ID_OVERLAY_VISIBLE: setOverlayVisible(getCheck(g_overlayCheck)); break;
     case ID_START_HIDDEN:    g_set.startHidden = getCheck(g_startHidden); saveSettings(); break;
@@ -2130,6 +2359,9 @@ static void onCommand(int id, int code) {
     case ID_TRAY_OPEN:   if (g_editor && IsWindowVisible(g_editor)) hideEditor(); else showEditor(); break;
     case ID_TRAY_TOGGLE: setOverlayVisible(!g_visible); break;
     case ID_TRAY_QUIT:   requestQuit(); break;
+    case ID_TRAY_REFRESH:
+    case ID_REFRESH:     refreshOverlay(); break;
+    case ID_TOGGLE_OVERLAY: setOverlayVisible(!g_visible); break;
     }
 }
 
@@ -2142,18 +2374,12 @@ static LRESULT CALLBACK editorProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         hideEditor();
         setStatus(L"");
         return 0;
-    // Modal loops (dragging the window, menus) stop the main loop; keep the overlay fresh.
-    case WM_ENTERSIZEMOVE:
-    case WM_ENTERMENULOOP:
-        SetTimer(h, 1, 10, nullptr);
+    case WM_TIMER: {   // keep the header's live status current
+        int kind = 1;
+        std::wstring st = overlayStatus(kind);
+        if (st != g_headerStatus || kind != g_headerKind) invalidateHeader();
         return 0;
-    case WM_EXITSIZEMOVE:
-    case WM_EXITMENULOOP:
-        KillTimer(h, 1);
-        return 0;
-    case WM_TIMER:
-        refreshMag();
-        return 0;
+    }
     case WM_DISPLAYCHANGE:
         if (g_ready) fillMonitors();
         break;
@@ -2176,17 +2402,19 @@ static LRESULT CALLBACK editorProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
+        paintHeader(dc);
         paintGroups(dc);
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_CTLCOLORSTATIC:
-        SetTextColor((HDC)wp, g_pal.text);
-        SetBkColor((HDC)wp, g_pal.bg);
-        return (LRESULT)g_bgBrush;
+    case WM_CTLCOLORSTATIC: {
+        bool outside = g_outside.count((HWND)lp) != 0;
+        SetTextColor((HDC)wp, (HWND)lp == g_status ? g_pal.textDim : g_pal.text);
+        SetBkColor((HDC)wp, outside ? g_pal.bg : g_pal.card);
+        return (LRESULT)(outside ? g_bgBrush : g_cardBrush);
+    }
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORLISTBOX:
-        if (!g_dark) break;
         SetTextColor((HDC)wp, g_pal.text);
         SetBkColor((HDC)wp, g_pal.ctrl);
         return (LRESULT)g_ctrlBrush;
@@ -2275,8 +2503,13 @@ static void createEditor() {
     HDC sdc = GetDC(nullptr);
     g_dpi = GetDeviceCaps(sdc, LOGPIXELSY);
     ReleaseDC(nullptr, sdc);
-    g_font = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    auto font = [](int pt, int weight) {
+        return CreateFontW(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    };
+    g_font = font(9, FW_NORMAL);
+    g_fontBold = font(9, FW_SEMIBOLD);
+    g_fontTitle = font(14, FW_SEMIBOLD);
 
     loadPalette();
 
@@ -2302,18 +2535,26 @@ static void createEditor() {
     childClass(L"CrosshairKeyBox", keyBoxProc, IDC_IBEAM);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT r = { 0, 0, S(1010), S(690) };
+    RECT r = { 0, 0, S(1010), S(690 + kHeader) };
     AdjustWindowRectEx(&r, style, FALSE, WS_EX_CONTROLPARENT);
     g_editor = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Crosshair Editor", style,
                                CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                                nullptr, nullptr, g_inst, nullptr);
+
+    // ---- header bar (status is painted; these two buttons sit on the right)
+    g_yOff = 0;
+    g_toggleBtn = button(L"Hide crosshair", 770, 9, 110, ID_TOGGLE_OVERLAY, 30);
+    HWND refreshBtn = button(L"Refresh overlay", 890, 9, 110, ID_REFRESH, 30);
+    g_outside = { g_toggleBtn, refreshBtn };
+    g_primary = { refreshBtn };
+    g_yOff = kHeader;
 
     // ---- column 1: presets, components, display
     group(L"Preset", 10, 6, 320, 88);
     g_presetCombo = combo(20, 26, 300, ID_PRESET_COMBO);
     label(L"Name", 20, 59, 36);
     g_nameEdit = mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 58, 58, 104, 22, ID_PRESET_NAME, WS_EX_CLIENTEDGE);
-    button(L"Save", 166, 57, 48, ID_PRESET_SAVE);
+    g_primary.insert(button(L"Save", 166, 57, 48, ID_PRESET_SAVE));
     button(L"New", 218, 57, 48, ID_PRESET_NEW);
     button(L"Delete", 270, 57, 50, ID_PRESET_DELETE);
 
@@ -2398,19 +2639,18 @@ static void createEditor() {
         }
     }
 
-    group(L"Hotkeys (click a box, press the keys)", 730, 306, 270, 334);
+    group(L"Hotkeys (click a box, press the keys)", 730, 306, 270, 342);
     for (int i = 0; i < HK_COUNT; ++i) {
-        int y = 326 + i * 25;
+        int y = 326 + i * 24;
         label(kHk[i].label, 740, y, 110);
         g_hkCtrl[i] = mk(L"CrosshairKeyBox", L"", WS_TABSTOP, 850, y, 118, 22, ID_HK + i);
         button(L"\u00D7", 970, y, 22, ID_HK_CLEAR + i, 22);
     }
-    button(L"Reset to defaults", 740, 326 + HK_COUNT * 25 + 4, 130, ID_HK_DEFAULTS);
+    button(L"Reset to defaults", 740, 326 + HK_COUNT * 24 + 4, 130, ID_HK_DEFAULTS);
 
     // ---- bottom bar
-    g_status = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 10, 655, 770, 20, -1);
-    button(L"Hide to tray", 790, 650, 100, ID_HIDE, 28);
-    button(L"Quit", 900, 650, 100, ID_QUIT, 28);
+    g_status = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 12, 657, 768, 20, -1);
+    g_outside.insert({ g_status, button(L"Hide to tray", 790, 652, 100, ID_HIDE, 28), button(L"Quit", 900, 652, 100, ID_QUIT, 28) });
 
     populateAll();
     populateHotkeys();
@@ -2421,6 +2661,7 @@ static void createEditor() {
     setCheck(g_startHidden, g_set.startHidden);
     SendMessageW(g_themeCombo, CB_SETCURSEL, std::clamp(g_set.theme, 0, 2), 0);
     applyTheme();
+    SetTimer(g_editor, 2, 500, nullptr);   // header status
     g_ready = true;
 }
 
@@ -2534,40 +2775,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
 
     enableVisualStyles();
 
-    if (!loadMagnification() || !MagInitialize()) {
-        MessageBoxW(nullptr, L"Could not initialise the Windows Magnification API.", L"Crosshair", MB_ICONERROR);
-        return 1;
-    }
-
-    WNDCLASSEXW wc{ sizeof(wc) };
-    wc.lpfnWndProc = hostProc;
-    wc.hInstance = inst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"InvertCrosshairHost";
-    RegisterClassExW(&wc);
-
-    g_host = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"Crosshair", WS_POPUP,
-        0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
-    SetLayeredWindowAttributes(g_host, 0, 255, LWA_ALPHA);
-
-    g_mag = CreateWindowExW(0, kMagClass, L"CrosshairMag", WS_CHILD | WS_VISIBLE,
-                            0, 0, 1, 1, g_host, nullptr, inst, nullptr);
-    if (!g_mag) {
-        MessageBoxW(nullptr, L"Could not create the magnifier control.", L"Crosshair", MB_ICONERROR);
-        return 1;
-    }
-
-    MagTransform identity = {};
-    identity.v[0][0] = identity.v[1][1] = identity.v[2][2] = 1.0f;
-    MagSetWindowTransform(g_mag, &identity);
-
-    // Don't capture ourselves, or we'd apply the effect to our own output.
-    HWND exclude[] = { g_host };
-    MagSetWindowFilterList(g_mag, kFilterExclude, 1, exclude);
-
     loadAllPresets();
+    if (!loadMagnification() || !startOverlay()) {
+        MessageBoxW(nullptr, L"Could not start the overlay (Windows Magnification API).", L"Crosshair", MB_ICONERROR);
+        return 1;
+    }
 
     int smallIcon = GetSystemMetrics(SM_CXSMICON), bigIcon = GetSystemMetrics(SM_CXICON);
     g_icon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, smallIcon, smallIcon, 0);   // from crosshair.rc
@@ -2583,39 +2795,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     if (!g_set.startHidden && !trayOnly) showEditor();
     setStatus(L"Preset: " + cur().name + L".  Closing this window keeps the crosshair running in the tray.");
 
-    timeBeginPeriod(1);
-    DWORD lastTopmost = GetTickCount();
-    bool running = true;
-    while (running) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { running = false; break; }
-            if (msg.message == WM_HOTKEY && !msg.hwnd) { onHotkey((int)msg.wParam - 1); continue; }
-            if (handleEditorKeys(msg)) continue;
-            if (g_editor && IsDialogMessageW(g_editor, &msg)) continue;
+    // The editor thread is purely event driven; the overlay runs its own frame loop.
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_HOTKEY && !msg.hwnd) onHotkey((int)msg.wParam - 1);
+        else if (!handleEditorKeys(msg) && !(g_editor && IsDialogMessageW(g_editor, &msg))) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (!running) break;
-
         syncHotkeyRegistration();
-        refreshMag();
-
-        // Games sometimes push themselves above other topmost windows; reassert periodically.
-        DWORD now = GetTickCount();
-        if (now - lastTopmost > 500) {
-            SetWindowPos(g_host, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-            lastTopmost = now;
-        }
-
-        if (g_set.fps > 0) Sleep(std::max(1, 1000 / g_set.fps));
-        else if (FAILED(DwmFlush())) Sleep(1);   // wait for the next composed frame
     }
-    timeEndPeriod(1);
-
+    stopOverlay();
     unregisterHotkeys();
-    MagUninitialize();
     if (single) { ReleaseMutex(single); CloseHandle(single); }
     return 0;
 }

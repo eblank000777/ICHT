@@ -18,7 +18,13 @@ No install needed either: `crosshair.exe` is portable and keeps its settings nex
 
 ## Use
 
-The editor opens on start; closing it keeps the crosshair running in the tray.
+The editor opens on start; closing it keeps the crosshair running in the tray. The header
+shows the overlay's live state (fps, hidden, or stalled).
+
+If the crosshair ever lags behind or freezes (for example after a game switches to
+fullscreen), press **Refresh overlay** in the header, Ctrl+Alt+U, or use the tray menu: it
+recreates the magnifier from scratch. The overlay runs on its own high-priority thread, so
+working in the editor does not slow it down.
 
 - **Components**: cross, dot, circle/ring, box, diagonal X; each can draw or erase.
 - **Pixels**: left-drag draws, right-drag erases, Shift+click resets, wheel zooms, Ctrl+Z / Ctrl+Y.
@@ -28,7 +34,7 @@ The editor opens on start; closing it keeps the crosshair running in the tray.
 - **Display**: monitor, update rate, theme (System / Light / Dark).
 - **Hotkeys**: click a box and press the keys. Defaults: Ctrl+Alt+H show/hide,
   Ctrl+Alt+E editor, Ctrl+Alt+N / P next / previous preset, Ctrl+Alt+Arrows nudge,
-  Ctrl+Alt+S save, Ctrl+Alt+R reload, Ctrl+Alt+Q quit.
+  Ctrl+Alt+S save, Ctrl+Alt+R reload, Ctrl+Alt+U refresh overlay, Ctrl+Alt+Q quit.
 
 `crosshair.exe /tray` starts with the editor hidden.
 

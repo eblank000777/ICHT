@@ -10,7 +10,7 @@ RequestExecutionLevel user
 ManifestDPIAware true
 
 !define APP_NAME    "Crosshair"
-!define APP_VERSION "2.1.0"
+!define APP_VERSION "2.2.0"
 !define APP_EXE     "crosshair.exe"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\Crosshair"
 !define RUN_KEY     "Software\Microsoft\Windows\CurrentVersion\Run"
